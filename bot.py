@@ -1,22 +1,19 @@
-import logging
-import httpx
-import sqlite3
 import asyncio
+import logging
+import sqlite3
 import os
 import json
+import httpx
 from datetime import datetime
 from typing import Dict, Any, Tuple
 from io import BytesIO
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # ========== НАСТРОЙКИ ==========
 BOT_TOKEN = "8979668811:AAHVemkoyYaTXnQpy2kOnzyKvi8dlb3efLw"
@@ -24,26 +21,23 @@ DEEPSCAN_TOKEN = "deepscan_6747528307:EbOVbwAg"
 CHANNEL_URL = "https://t.me/Insightix"
 SUPPORT_LINK = "https://t.me/bothkm"
 ADMIN_ID = 6747528307
+MENU_IMAGE_URL = "https://i.ibb.co/Xx9ZftNz/menu.png"
 
-# Премиум эмодзи ID для кнопок
-BTN_SEARCH = "5893382531037794941"      # 🔎 Искать
-BTN_PROFILE = "5893161718179173515"     # ⚙️ Профиль
-BTN_NEWS = "5258023599419171861"        # 🔧 Новости
-BTN_SUPPORT = "5364052602357044385"     # 🐶 Поддержка
-BTN_BACK = "5258328383183396223"        # ◀️ Назад
-
-# Премиум эмодзи ID для текстовых сообщений
+# Премиум эмодзи ID
 EMOJI_WELCOME = "5895713431264170680"
 EMOJI_POINT = "5886676966102274844"
 EMOJI_SEARCHING = "5429411030960711866"
 EMOJI_WAIT = "5210838989921106328"
 EMOJI_SUCCESS = "5843918217323484232"
-EMOJI_INFO = "5258503720928288433"
-EMOJI_STAR = "5895770017458294953"
+EMOJI_WARNING = "5893081007153746175"
+EMOJI_PROFILE = "5893161718179173515"
+EMOJI_NEWS = "5258023599419171861"
+EMOJI_SUPPORT = "5364052602357044385"
+EMOJI_SEARCH = "5258274739041883702"
+EMOJI_USER = "5902335789798265487"
 
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BOT_DIR, 'insightx.db')
-PHOTO_PATH = os.path.join(BOT_DIR, 'menu.jpg')
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -51,11 +45,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# ========== СОСТОЯНИЯ FSM ==========
+class SearchState(StatesGroup):
+    waiting_for_query = State()
+
+
+class BroadcastState(StatesGroup):
+    waiting_for_message = State()
+
 
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -70,40 +77,54 @@ def init_db():
         )
     ''')
     
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS search_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            query TEXT,
+            search_type TEXT,
+            sources_count INTEGER,
+            timestamp TEXT
+        )
+    ''')
+    
     cursor.execute("SELECT * FROM users WHERE user_id = ?", (ADMIN_ID,))
     if not cursor.fetchone():
-        cursor.execute(
-            "INSERT INTO users (user_id, username, first_name, reg_date, last_reset, is_admin, subscribed_to_channel) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ADMIN_ID, "admin", "Admin", datetime.now().isoformat(), datetime.now().isoformat(), 1, 1)
-        )
+        cursor.execute('''
+            INSERT INTO users (user_id, username, first_name, reg_date, last_reset, is_admin, subscribed_to_channel) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (ADMIN_ID, "admin", "Admin", datetime.now().isoformat(), datetime.now().isoformat(), 1, 1))
     
     conn.commit()
     conn.close()
-    print(f"✅ База данных: {DB_PATH}")
+    print(f"[OK] База данных: {DB_PATH}")
 
 
 def add_user(user_id: int, username: str, first_name: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
     cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     if not cursor.fetchone():
-        cursor.execute(
-            "INSERT INTO users (user_id, username, first_name, reg_date, last_reset) VALUES (?, ?, ?, ?, ?)",
-            (user_id, username, first_name, datetime.now().isoformat(), datetime.now().isoformat())
-        )
-    conn.commit()
+        cursor.execute('''
+            INSERT INTO users (user_id, username, first_name, reg_date, last_reset, subscribed_to_channel) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, username or "", first_name or "", datetime.now().isoformat(), datetime.now().isoformat(), 0))
+        conn.commit()
+    
     conn.close()
 
 
-def get_user_info(user_id: int) -> Dict:
+def get_user_info(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT user_id, username, requests_today, total_requests, is_admin, subscribed_to_channel FROM users WHERE user_id = ?",
-        (user_id,)
-    )
+    cursor.execute('''
+        SELECT user_id, username, requests_today, total_requests, is_admin, subscribed_to_channel 
+        FROM users WHERE user_id = ?
+    ''', (user_id,))
     row = cursor.fetchone()
     conn.close()
+    
     if row:
         return {
             "user_id": row[0],
@@ -113,21 +134,10 @@ def get_user_info(user_id: int) -> Dict:
             "is_admin": row[4] or 0,
             "subscribed_to_channel": row[5] or 0
         }
-    return {"user_id": user_id, "requests_today": 0, "total_requests": 0, "is_admin": 0, "subscribed_to_channel": 0}
+    return None
 
 
-def check_subscribed_to_channel(user_id: int) -> bool:
-    if user_id == ADMIN_ID:
-        return True
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT subscribed_to_channel FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result and result[0] == 1
-
-
-def mark_channel_subscribed(user_id: int):
+def mark_subscribed(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET subscribed_to_channel = 1 WHERE user_id = ?", (user_id,))
@@ -141,54 +151,129 @@ def increment_request(user_id: int) -> bool:
     cursor.execute("SELECT requests_today, last_reset FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     
-    if row:
-        requests_today, last_reset = row
+    if not row:
+        conn.close()
+        return False
+    
+    requests_today, last_reset = row
+    
+    if last_reset:
         last_reset_date = datetime.fromisoformat(last_reset)
-        
         if datetime.now().date() > last_reset_date.date():
             requests_today = 0
-            last_reset = datetime.now().isoformat()
-        
-        if requests_today >= 50:
-            conn.close()
-            return False
-        
-        cursor.execute(
-            "UPDATE users SET requests_today = ?, last_reset = ?, total_requests = total_requests + 1 WHERE user_id = ?",
-            (requests_today + 1, last_reset, user_id)
-        )
-        conn.commit()
+    
+    if requests_today >= 50:
         conn.close()
-        return True
+        return False
+    
+    cursor.execute('''
+        UPDATE users SET requests_today = ?, total_requests = total_requests + 1, last_reset = ? 
+        WHERE user_id = ?
+    ''', (requests_today + 1, datetime.now().isoformat(), user_id))
+    conn.commit()
     conn.close()
-    return False
+    return True
+
+
+def log_search(user_id: int, query: str, search_type: str, sources_count: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO search_logs (user_id, query, search_type, sources_count, timestamp) 
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, query[:100], search_type, sources_count, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
 
 
 def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, username, first_name, total_requests FROM users WHERE user_id != ?", (ADMIN_ID,))
+    cursor.execute("SELECT user_id FROM users")
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return users
+
+
+def get_stats():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE subscribed_to_channel = 1")
+    subscribed_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT SUM(total_requests) FROM users")
+    total_requests = cursor.fetchone()[0] or 0
+    
+    cursor.execute("SELECT SUM(requests_today) FROM users")
+    today_requests = cursor.fetchone()[0] or 0
+    
+    conn.close()
+    return total_users, subscribed_users, total_requests, today_requests
+
+
+def get_recent_logs(limit: int = 10):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT user_id, query, search_type, sources_count, timestamp 
+        FROM search_logs ORDER BY id DESC LIMIT ?
+    ''', (limit,))
+    logs = cursor.fetchall()
+    conn.close()
+    return logs
+
+
+def get_users_list():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username, first_name, total_requests, subscribed_to_channel FROM users")
     users = cursor.fetchall()
     conn.close()
     return users
 
 
-def get_users_count():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users WHERE user_id != ?", (ADMIN_ID,))
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count
+# ========== КЛАВИАТУРЫ ==========
+def get_main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="НАЧАТЬ ПОИСК", callback_data="main_start")],
+        [
+            InlineKeyboardButton(text="ПРОФИЛЬ", callback_data="menu_profile"),
+            InlineKeyboardButton(text="НОВОСТИ", callback_data="menu_news"),
+        ],
+        [
+            InlineKeyboardButton(text="ПОДДЕРЖКА", callback_data="menu_support"),
+        ],
+    ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton(text="АДМИН ПАНЕЛЬ", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_total_requests():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT SUM(total_requests) FROM users WHERE user_id != ?", (ADMIN_ID,))
-    result = cursor.fetchone()[0]
-    conn.close()
-    return result or 0
+def get_back_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀ НАЗАД", callback_data="main_menu")]
+    ])
+
+
+def get_channel_check_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="ПРОВЕРИТЬ ПОДПИСКУ", callback_data="check_subscribe")],
+        [InlineKeyboardButton(text="ПЕРЕЙТИ НА КАНАЛ", url=CHANNEL_URL)],
+    ])
+
+
+def get_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="СТАТИСТИКА", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="ЛОГИ ПОИСКА", callback_data="admin_logs")],
+        [InlineKeyboardButton(text="ПОЛЬЗОВАТЕЛИ", callback_data="admin_users")],
+        [InlineKeyboardButton(text="РАССЫЛКА", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="◀ НАЗАД", callback_data="main_menu")],
+    ])
 
 
 # ========== DEEPSCAN API ==========
@@ -198,21 +283,21 @@ async def deepscan_search(query: str) -> Tuple[bool, Dict[str, Any]]:
     payload = {"token": DEEPSCAN_TOKEN, "search": clean_query}
     
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=180.0) as client:
             response = await client.post(url, json=payload)
             if response.status_code == 200:
                 data = response.json()
                 if data.get("ok"):
                     return True, data
-                return False, {"error": f'<tg-emoji emoji-id="{EMOJI_INFO}">❌</tg-emoji> Ничего не найдено'}
-            return False, {"error": f'<tg-emoji emoji-id="{EMOJI_INFO}">❌</tg-emoji> Ошибка API: {response.status_code}'}
+                return False, {"error": "Ничего не найдено"}
+            return False, {"error": f"Ошибка API: {response.status_code}"}
     except Exception as e:
         logger.error(f"DeepScan error: {e}")
-        return False, {"error": f'<tg-emoji emoji-id="{EMOJI_INFO}">❌</tg-emoji> Ошибка: {str(e)}'}
+        return False, {"error": f"Ошибка: {str(e)}"}
 
 
 # ========== HTML ОТЧЁТ ==========
-def generate_html_report(data: Dict[str, Any], query: str) -> str:
+def generate_html_report(data: dict, query: str) -> str:
     search_type = data.get('type', 'unknown')
     uuid = data.get('uuid', '—')
     links = data.get('links', [])
@@ -229,7 +314,7 @@ def generate_html_report(data: Dict[str, Any], query: str) -> str:
     
     all_names = []
     for name in possible_names:
-        if name not in all_names:
+        if name and name not in all_names:
             all_names.append(name)
     for item in full_result:
         if item.get('fio') and item['fio'] not in all_names:
@@ -264,6 +349,11 @@ def generate_html_report(data: Dict[str, Any], query: str) -> str:
         if isinstance(bank, dict):
             banks.append(bank)
     
+    all_ips = []
+    for item in full_result:
+        if item.get('ip_address') and item['ip_address'] not in all_ips:
+            all_ips.append(item['ip_address'])
+    
     tg_link = None
     tg_username = None
     if telegram_data:
@@ -271,517 +361,435 @@ def generate_html_report(data: Dict[str, Any], query: str) -> str:
         if tg_username:
             tg_link = f"https://t.me/{tg_username}"
     
-    birthday = fast_result.get('birthday', ['—'])[0] if fast_result.get('birthday') else '—'
-    if isinstance(birthday, list):
-        birthday = birthday[0] if birthday else '—'
-    
     html = f'''<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>InsightX | {query}</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            background: linear-gradient(135deg, #0a0a0a 0%, #0d0d0d 100%);
-            font-family: 'Segoe UI', -apple-system, sans-serif;
-            padding: 20px;
-        }}
-        .container {{ max-width: 1000px; margin: 0 auto; }}
-        .header {{
-            text-align: center;
-            padding: 30px;
-            background: linear-gradient(135deg, rgba(255,0,0,0.1), rgba(0,0,0,0.3));
-            border-radius: 20px;
-            margin-bottom: 20px;
-            border: 1px solid rgba(255,0,0,0.3);
-        }}
-        .header h1 {{
-            font-size: 2em;
-            background: linear-gradient(135deg, #ff3333, #ff0000);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }}
-        .header i {{ color: #ff0000; margin: 0 10px; }}
-        .query-card {{
-            background: rgba(255,0,0,0.05);
-            border-radius: 16px;
-            padding: 20px;
-            margin-bottom: 20px;
-            border: 1px solid rgba(255,0,0,0.2);
-        }}
-        .query-card .value {{ font-size: 1.2em; color: #fff; word-break: break-all; }}
-        .stats {{
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 15px;
-            margin-bottom: 20px;
-        }}
-        .stat-card {{
-            background: rgba(255,0,0,0.05);
-            border-radius: 16px;
-            padding: 15px;
-            text-align: center;
-            border: 1px solid rgba(255,0,0,0.15);
-        }}
-        .stat-card i {{ font-size: 1.8em; color: #ff0000; margin-bottom: 8px; }}
-        .stat-card .number {{ font-size: 1.5em; font-weight: 700; color: #ff3333; }}
-        .section {{
-            background: rgba(0,0,0,0.4);
-            border-radius: 16px;
-            margin-bottom: 12px;
-            border: 1px solid rgba(255,0,0,0.1);
-        }}
-        .section-header {{
-            padding: 12px 18px;
-            background: rgba(255,0,0,0.08);
-            cursor: pointer;
-            display: flex;
-            justify-content: space-between;
-            color: #ff3333;
-            font-weight: 600;
-            border-left: 3px solid #ff0000;
-        }}
-        .section-header i {{ margin-right: 8px; }}
-        .section-content {{ padding: 15px 18px; border-top: 1px solid rgba(255,0,0,0.1); }}
-        .section-content.collapsed {{ display: none; }}
-        .item {{
-            padding: 10px 0;
-            border-bottom: 1px solid rgba(255,0,0,0.08);
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }}
-        .item-key {{ width: 120px; color: rgba(255,255,255,0.5); }}
-        .item-key i {{ width: 20px; margin-right: 8px; color: #ff0000; }}
-        .item-value {{ flex: 1; color: #fff; word-break: break-word; }}
-        .item-value a {{ color: #ff4444; text-decoration: none; }}
-        .tag {{
-            display: inline-block;
-            background: rgba(255,0,0,0.1);
-            padding: 5px 12px;
-            border-radius: 20px;
-            margin: 4px;
-            font-size: 0.85em;
-            color: #ff6666;
-            border: 1px solid rgba(255,0,0,0.2);
-        }}
-        .footer {{
-            text-align: center;
-            padding: 20px;
-            color: rgba(255,255,255,0.3);
-            font-size: 0.7em;
-            border-top: 1px solid rgba(255,0,0,0.1);
-            margin-top: 20px;
-        }}
-        @media (max-width: 600px) {{
-            .stats {{ grid-template-columns: repeat(2, 1fr); }}
-            .item {{ flex-direction: column; }}
-            .item-key {{ width: 100%; }}
-        }}
+        body {{ background: #0D0D0F; font-family: 'Inter', sans-serif; color: #FFFFFF; line-height: 1.5; }}
+        .container {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
+        .header {{ text-align: center; padding: 32px; background: linear-gradient(135deg, rgba(113,170,235,0.1), rgba(0,0,0,0.3)); border-radius: 20px; margin-bottom: 24px; border: 1px solid rgba(113,170,235,0.2); }}
+        .header h1 {{ font-size: 28px; color: #71aaeb; }}
+        .query-card {{ background: rgba(255,255,255,0.03); border-radius: 16px; padding: 24px; margin-bottom: 24px; border: 1px solid rgba(255,255,255,0.08); }}
+        .query-card .value {{ font-size: 18px; font-weight: 600; word-break: break-all; }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 24px; }}
+        .stat-card {{ background: rgba(255,255,255,0.03); border-radius: 16px; padding: 20px; text-align: center; border: 1px solid rgba(255,255,255,0.08); }}
+        .stat-number {{ font-size: 28px; font-weight: 700; color: #71aaeb; }}
+        .stat-label {{ font-size: 12px; color: #8E8E93; margin-top: 8px; }}
+        .data-block {{ background: rgba(255,255,255,0.03); border-radius: 16px; margin-bottom: 16px; border: 1px solid rgba(255,255,255,0.08); overflow: hidden; }}
+        .block-header {{ display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; cursor: pointer; background: rgba(255,255,255,0.02); }}
+        .block-header:hover {{ background: rgba(255,255,255,0.05); }}
+        .block-title {{ font-weight: 600; }}
+        .block-toggle {{ transition: transform 0.3s; }}
+        .block-toggle.collapsed {{ transform: rotate(-90deg); }}
+        .block-content {{ padding: 16px 20px; border-top: 1px solid rgba(255,255,255,0.08); }}
+        .block-content.collapsed {{ display: none; }}
+        .data-row {{ display: flex; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }}
+        .data-key {{ width: 180px; color: #8E8E93; font-size: 13px; }}
+        .data-value {{ flex: 1; word-break: break-word; font-size: 13px; }}
+        .data-value a {{ color: #71aaeb; text-decoration: none; }}
+        .tag {{ display: inline-block; background: rgba(113,170,235,0.12); padding: 6px 14px; border-radius: 20px; font-size: 13px; margin: 4px; color: #71aaeb; cursor: pointer; }}
+        .footer {{ text-align: center; padding: 24px; color: #8E8E93; font-size: 12px; border-top: 1px solid rgba(255,255,255,0.08); margin-top: 24px; }}
+        @media (max-width: 768px) {{ .stats-grid {{ grid-template-columns: repeat(2, 1fr); }} .data-row {{ flex-direction: column; }} .data-key {{ width: 100%; margin-bottom: 4px; }} }}
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header"><i class="fas fa-bolt"></i><h1>INSIGHT X</h1><i class="fas fa-brain"></i></div>
-        <div class="query-card"><div class="value"><i class="fas fa-search"></i> ЗАПРОС: {query}</div><div style="margin-top: 8px; color: #666;">Тип: {search_type} | UUID: {uuid[:8]}...</div></div>
-        <div class="stats">
-            <div class="stat-card"><i class="fas fa-database"></i><div class="number">{sources_count}</div><div>Источников</div></div>
-            <div class="stat-card"><i class="fas fa-link"></i><div class="number">{len(links)}</div><div>Связей</div></div>
-            <div class="stat-card"><i class="fas fa-users"></i><div class="number">{len(all_names)}</div><div>Имён</div></div>
-            <div class="stat-card"><i class="fas fa-building-columns"></i><div class="number">{len(banks)}</div><div>Банков</div></div>
-        </div>
-        {f'''
-        <div class="section"><div class="section-header" onclick="toggleSection(this)"><i class="fas fa-signal"></i> ИНФОРМАЦИЯ О НОМЕРЕ <i class="fas fa-chevron-down"></i></div>
-        <div class="section-content">
-            <div class="item"><div class="item-key"><i class="fas fa-flag"></i> Страна:</div><div class="item-value">{phone_info.get('country', '—')}</div></div>
-            <div class="item"><div class="item-key"><i class="fas fa-tower-cell"></i> Оператор:</div><div class="item-value">{phone_info.get('operator', '—')}</div></div>
-            <div class="item"><div class="item-key"><i class="fas fa-location-dot"></i> Регион:</div><div class="item-value">{phone_info.get('region', '—')}</div></div>
-        </div></div>
-        ''' if phone_info else ''}
-        {f'''
-        <div class="section"><div class="section-header" onclick="toggleSection(this)"><i class="fas fa-users"></i> ВОЗМОЖНЫЕ ИМЕНА <i class="fas fa-chevron-down"></i></div>
-        <div class="section-content">{''.join([f'<span class="tag"><i class="fas fa-tag"></i> {name}</span>' for name in all_names[:20]])}</div></div>
-        ''' if all_names else ''}
-        {f'''
-        <div class="section"><div class="section-header" onclick="toggleSection(this)"><i class="fas fa-envelope"></i> EMAIL АДРЕСА <i class="fas fa-chevron-down"></i></div>
-        <div class="section-content">{''.join([f'<div class="item"><div class="item-key"><i class="fas fa-at"></i> Email:</div><div class="item-value"><a href="mailto:{email}">{email}</a></div></div>' for email in all_emails[:10]])}</div></div>
-        ''' if all_emails else ''}
-        {f'''
-        <div class="section"><div class="section-header" onclick="toggleSection(this)"><i class="fas fa-phone"></i> ТЕЛЕФОНЫ <i class="fas fa-chevron-down"></i></div>
-        <div class="section-content">{''.join([f'<div class="item"><div class="item-key"><i class="fas fa-mobile-alt"></i> Номер:</div><div class="item-value">{phone}</div></div>' for phone in all_phones[:10]])}</div></div>
-        ''' if all_phones else ''}
-        {f'''
-        <div class="section"><div class="section-header" onclick="toggleSection(this)"><i class="fas fa-building-columns"></i> БАНКОВСКИЕ СЕРВИСЫ <i class="fas fa-chevron-down"></i></div>
-        <div class="section-content">{''.join([f'<div class="item"><div class="item-key"><i class="fas fa-university"></i> {bank.get("bank", "Банк")}:</div><div class="item-value">{bank.get("name", "—")}</div></div>' for bank in banks[:15]])}</div></div>
-        ''' if banks else ''}
-        {f'''
-        <div class="section"><div class="section-header" onclick="toggleSection(this)"><i class="fab fa-telegram"></i> TELEGRAM <i class="fas fa-chevron-down"></i></div>
-        <div class="section-content"><div class="item"><div class="item-key"><i class="fab fa-telegram"></i> Профиль:</div><div class="item-value"><a href="{tg_link}" target="_blank">@{tg_username}</a></div></div></div></div>
-        ''' if tg_link else ''}
-        {f'''
-        <div class="section"><div class="section-header" onclick="toggleSection(this)"><i class="fas fa-link"></i> НАЙДЕННЫЕ СВЯЗИ <i class="fas fa-chevron-down"></i></div>
-        <div class="section-content">{''.join([f'<div class="item"><div class="item-key"><i class="fas fa-external-link-alt"></i> Связь:</div><div class="item-value"><a href="{link}" target="_blank">{link}</a></div></div>' for link in links[:15]])}</div></div>
-        ''' if links else ''}
-        <div class="footer"><p><i class="fas fa-bolt"></i> INSIGHTX — профессиональный поиск информации <i class="fas fa-brain"></i></p><p><a href="{CHANNEL_URL}" target="_blank"><i class="fab fa-telegram"></i> @Insightix</a></p></div>
+        <div class="header"><h1>INSIGHT X</h1><p style="color: #8E8E93; margin-top: 8px;">Профессиональный поиск информации</p></div>
+        <div class="query-card"><div class="value">Запрос: {query}</div><div style="margin-top: 12px; font-size: 12px; color: #666;">Тип: {search_type} | UUID: {uuid[:8]}</div></div>
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-number">{sources_count}</div><div class="stat-label">Источников</div></div>
+            <div class="stat-card"><div class="stat-number">{len(links)}</div><div class="stat-label">Связей</div></div>
+            <div class="stat-card"><div class="stat-number">{len(all_names)}</div><div class="stat-label">Имён</div></div>
+            <div class="stat-card"><div class="stat-number">{len(banks)}</div><div class="stat-label">Банков</div></div>
+            <div class="stat-card"><div class="stat-number">{len(all_ips)}</div><div class="stat-label">IP</div></div>
+        </div>'''
+    
+    if phone_info:
+        html += f'''
+        <div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">📞 Информация о номере</div><div class="block-toggle">▼</div></div>
+        <div class="block-content">
+            <div class="data-row"><div class="data-key">Страна:</div><div class="data-value">{phone_info.get('country', '—')}</div></div>
+            <div class="data-row"><div class="data-key">Оператор:</div><div class="data-value">{phone_info.get('operator', '—')}</div></div>
+            <div class="data-row"><div class="data-key">Регион:</div><div class="data-value">{phone_info.get('region', '—')}</div></div>
+        </div></div>'''
+    
+    if all_names:
+        names_html = ''.join(f'<span class="tag" onclick="copyText(\'{name}\')">{name}</span>' for name in all_names[:30])
+        html += f'<div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">👥 Возможные имена</div><div class="block-toggle">▼</div></div><div class="block-content">{names_html}</div></div>'
+    
+    if all_emails:
+        emails_html = ''.join(f'<div class="data-row"><div class="data-key">Email:</div><div class="data-value"><a href="mailto:{e}">{e}</a></div></div>' for e in all_emails[:20])
+        html += f'<div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">📧 Email адреса</div><div class="block-toggle">▼</div></div><div class="block-content">{emails_html}</div></div>'
+    
+    if all_phones:
+        phones_html = ''.join(f'<div class="data-row"><div class="data-key">Номер:</div><div class="data-value">{p}</div></div>' for p in all_phones[:20])
+        html += f'<div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">📱 Телефоны</div><div class="block-toggle">▼</div></div><div class="block-content">{phones_html}</div></div>'
+    
+    if banks:
+        banks_html = ''.join(f'<div class="data-row"><div class="data-key">{b.get("bank", "Банк")}:</div><div class="data-value">{b.get("name", "—")}</div></div>' for b in banks[:20])
+        html += f'<div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">🏦 Банковские сервисы</div><div class="block-toggle">▼</div></div><div class="block-content">{banks_html}</div></div>'
+    
+    if all_ips:
+        ips_html = ''.join(f'<div class="data-row"><div class="data-key">IP:</div><div class="data-value">{ip}</div></div>' for ip in all_ips[:10])
+        html += f'<div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">🌐 IP-адреса</div><div class="block-toggle">▼</div></div><div class="block-content">{ips_html}</div></div>'
+    
+    if tg_link:
+        html += f'<div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">💬 Telegram</div><div class="block-toggle">▼</div></div><div class="block-content"><div class="data-row"><div class="data-key">Профиль:</div><div class="data-value"><a href="{tg_link}" target="_blank">@{tg_username}</a></div></div></div></div>'
+    
+    if registers:
+        regs_html = ''.join(f'<span class="tag">{reg}</span>' for reg in registers[:15])
+        html += f'<div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">📚 Реестры</div><div class="block-toggle">▼</div></div><div class="block-content">{regs_html}</div></div>'
+    
+    if links:
+        links_html = ''.join(f'<div class="data-row"><div class="data-key">Связь:</div><div class="data-value"><a href="{l}" target="_blank">{l}</a></div></div>' for l in links[:30])
+        html += f'<div class="data-block"><div class="block-header" onclick="toggleBlock(this)"><div class="block-title">🔗 Найденные связи</div><div class="block-toggle">▼</div></div><div class="block-content">{links_html}</div></div>'
+    
+    html += f'''
+        <div class="footer"><p>INSIGHTX — профессиональный поиск информации</p><p><a href="{CHANNEL_URL}" target="_blank" style="color: #71aaeb;">@Insightix</a></p></div>
     </div>
-    <script>function toggleSection(header){{const content=header.nextElementSibling;header.classList.toggle('collapsed');content.classList.toggle('collapsed');}}</script>
+    <script>
+        function toggleBlock(header) {{
+            var content = header.nextElementSibling;
+            var toggle = header.querySelector('.block-toggle');
+            content.classList.toggle('collapsed');
+            toggle.classList.toggle('collapsed');
+        }}
+        function copyText(text) {{
+            navigator.clipboard.writeText(text);
+            var notification = document.createElement('div');
+            notification.textContent = 'Скопировано!';
+            notification.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#71aaeb;color:#000;padding:8px 16px;border-radius:8px;z-index:9999;';
+            document.body.appendChild(notification);
+            setTimeout(function() {{ notification.remove(); }}, 1500);
+        }}
+    </script>
 </body>
 </html>'''
+    
     return html
 
 
-# ========== КЛАВИАТУРЫ С ПРЕМИУМ ЭМОДЗИ НА КНОПКАХ ==========
-def get_main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(
-            text="Искать",
-            callback_data="main_start",
-            icon_custom_emoji_id=BTN_SEARCH
-        )],
-        [
-            InlineKeyboardButton(
-                text="Профиль",
-                callback_data="menu_profile",
-                icon_custom_emoji_id=BTN_PROFILE
-            ),
-            InlineKeyboardButton(
-                text="Новости",
-                callback_data="menu_news",
-                icon_custom_emoji_id=BTN_NEWS
-            ),
-            InlineKeyboardButton(
-                text="Поддержка",
-                callback_data="menu_support",
-                icon_custom_emoji_id=BTN_SUPPORT
-            ),
-        ],
-    ]
-    if is_admin:
-        buttons.append([InlineKeyboardButton("⚙️ Админ панель", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def get_back_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            text="Назад",
-            callback_data="main_menu",
-            icon_custom_emoji_id=BTN_BACK
-        )
-    ]])
-
-
-def get_channel_check_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Я подписался", callback_data="check_subscribe")],
-        [InlineKeyboardButton("📢 Перейти на канал", url=CHANNEL_URL)],
-    ])
-
-
-def get_admin_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")],
-    ])
-
-
 # ========== ОБРАБОТЧИКИ ==========
-async def send_main_menu(chat_id: int, text: str, reply_markup, context):
-    if os.path.exists(PHOTO_PATH):
-        try:
-            with open(PHOTO_PATH, 'rb') as photo:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photo,
-                    caption=text,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup
-                )
-            return
-        except:
-            pass
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    user = message.from_user
+    add_user(user.id, user.username or "", user.first_name or "")
+    user_info = get_user_info(user.id)
+    is_admin = user_info.get("is_admin", False) if user_info else False
     
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
+    await state.clear()
+    
+    text = f'<tg-emoji emoji-id="{EMOJI_WELCOME}">✅</tg-emoji> <b>Добро пожаловать в InsightX, {user.first_name}!</b>\n\n<blockquote>Получите полное представление: узнайте всё о людях, их контактах, связях, местоположении, имуществе и криминальном прошлом.</blockquote>\n\n<tg-emoji emoji-id="{EMOJI_POINT}">👇</tg-emoji> <b>Выберите действие:</b>'
+    
+    try:
+        await message.answer_photo(
+            photo=MENU_IMAGE_URL,
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=get_main_menu(is_admin)
+        )
+    except:
+        await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu(is_admin))
+
+
+@dp.callback_query(F.data == "main_menu")
+async def callback_main_menu(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    user_info = get_user_info(callback.from_user.id)
+    is_admin = user_info.get("is_admin", False) if user_info else False
+    
+    text = f'<tg-emoji emoji-id="{EMOJI_WELCOME}">✅</tg-emoji> <b>Добро пожаловать в InsightX!</b>\n\n<blockquote>Получите полное представление: узнайте всё о людях, их контактах, связях, местоположении, имуществе и криминальном прошлом.</blockquote>\n\n<tg-emoji emoji-id="{EMOJI_POINT}">👇</tg-emoji> <b>Выберите действие:</b>'
+    
+    await callback.message.delete()
+    await callback.message.answer_photo(
+        photo=MENU_IMAGE_URL,
+        caption=text,
         parse_mode="HTML",
-        reply_markup=reply_markup,
-        disable_web_page_preview=True
+        reply_markup=get_main_menu(is_admin)
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user:
-        return
+@dp.callback_query(F.data == "main_start")
+async def callback_main_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.delete()
     
-    add_user(user.id, user.username or "", user.first_name or "")
+    text = f'<tg-emoji emoji-id="{EMOJI_SEARCHING}">🔍</tg-emoji> <b>Введите данные для поиска</b>\n\n<blockquote>Система автоматически определит тип запроса</blockquote>'
     
-    if not check_subscribed_to_channel(user.id):
-        text = f'''<tg-emoji emoji-id="{EMOJI_WELCOME}">✅</tg-emoji> <b>Добро пожаловать в InsightX, {user.first_name}!</b>
-
-<blockquote>Получите полное представление: узнайте всё о людях, их контактах, связях, местоположении, имуществе и криминальном прошлом.</blockquote>
-
-⚠️ <b>Для доступа подпишись на канал:</b>
-{CHANNEL_URL}
-
-<tg-emoji emoji-id="{EMOJI_POINT}">👆</tg-emoji> <b>После подписки нажми кнопку:</b>'''
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_channel_check_menu(), disable_web_page_preview=True)
-        return
-    
-    user_info = get_user_info(user.id)
-    is_admin = user_info.get("is_admin", False)
-    
-    text = f'''<tg-emoji emoji-id="{EMOJI_WELCOME}">✅</tg-emoji> <b>Добро пожаловать в InsightX, {user.first_name}!</b>
-
-<blockquote>Получите полное представление: узнайте всё о людях, их контактах, связях, местоположении, имуществе и криминальном прошлом.</blockquote>
-
-<tg-emoji emoji-id="{EMOJI_POINT}">👆</tg-emoji> <b>Используй кнопки:</b>'''
-    if is_admin:
-        text += "\n\n👑 <b>Вы вошли как АДМИНИСТРАТОР</b>"
-    
-    await send_main_menu(update.effective_chat.id, text, get_main_menu(is_admin), context)
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=get_back_menu())
+    await state.set_state(SearchState.waiting_for_query)
 
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
+@dp.callback_query(F.data == "menu_profile")
+async def callback_menu_profile(callback: types.CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
     user_info = get_user_info(user_id)
-    is_admin = user_info.get("is_admin", False)
     
-    if query.data == "check_subscribe":
-        mark_channel_subscribed(user_id)
-        text = f'''<tg-emoji emoji-id="{EMOJI_SUCCESS}">✅</tg-emoji> <b>Доступ открыт!</b>
-
-<tg-emoji emoji-id="{EMOJI_STAR}">💫</tg-emoji> Теперь ты можешь пользоваться InsightX.
-
-<blockquote>Получите полное представление: узнайте всё о людях, их контактах, связях, местоположении, имуществе и криминальном прошлом.</blockquote>'''
-        if is_admin:
-            text += "\n\n👑 <b>Вы вошли как АДМИНИСТРАТОР</b>"
-        await send_main_menu(query.message.chat.id, text, get_main_menu(is_admin), context)
-        await query.message.delete()
-        return
-    
-    if query.data == "main_menu":
-        text = f'''<tg-emoji emoji-id="{EMOJI_WELCOME}">✅</tg-emoji> <b>Добро пожаловать в InsightX!</b>
-
-<blockquote>Получите полное представление: узнайте всё о людях, их контактах, связях, местоположении, имуществе и криминальном прошлом.</blockquote>
-
-<tg-emoji emoji-id="{EMOJI_POINT}">👆</tg-emoji> <b>Используй кнопки:</b>'''
-        if is_admin:
-            text += "\n\n👑 <b>Вы вошли как АДМИНИСТРАТОР</b>"
-        await send_main_menu(query.message.chat.id, text, get_main_menu(is_admin), context)
-        await query.message.delete()
-        context.user_data.pop("awaiting_search", None)
-        return
-    
-    if query.data == "main_start":
-        text = f'''<tg-emoji emoji-id="{BTN_SEARCH}">🔎</tg-emoji> <b>Введите данные для поиска:</b>
-
-<blockquote>
-• Номер телефона
-• ФИО
-• Email
-• Telegram username
-</blockquote>
-
-<i>Система автоматически определит тип запроса</i>'''
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=get_back_menu())
-        context.user_data["awaiting_search"] = True
-        return
-    
-    if query.data == "menu_profile":
+    if user_info:
         requests_today = user_info.get("requests_today", 0)
         total_requests = user_info.get("total_requests", 0)
-        
-        text = f'''<tg-emoji emoji-id="{BTN_PROFILE}">⚙️</tg-emoji> <b>ПРОФИЛЬ</b>
-
-<blockquote>
-├ 🆔 ID: <code>{user_id}</code>
-├ 📊 Запросов сегодня: {requests_today}/50
-├ 📈 Всего запросов: {total_requests}
-</blockquote>'''
-        
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=get_back_menu(), disable_web_page_preview=True)
-        return
+        text = f'<tg-emoji emoji-id="{EMOJI_PROFILE}">👤</tg-emoji> <b>ПРОФИЛЬ</b>\n\n<blockquote>\n├ ID: <code>{user_id}</code>\n├ Запросов сегодня: {requests_today}/50\n├ Всего запросов: {total_requests}\n</blockquote>'
+    else:
+        text = f'<tg-emoji emoji-id="{EMOJI_PROFILE}">👤</tg-emoji> <b>ПРОФИЛЬ</b>\n\n<blockquote>\n├ ID: <code>{user_id}</code>\n├ Запросов сегодня: 0/50\n├ Всего запросов: 0\n</blockquote>'
     
-    if query.data == "menu_support":
-        await query.edit_message_text(
-            f'''<tg-emoji emoji-id="{BTN_SUPPORT}">🐶</tg-emoji> <b>ПОДДЕРЖКА</b>
-
-<blockquote>
-📢 Канал: {CHANNEL_URL}
-👨‍💻 Техподдержка: {SUPPORT_LINK}
-</blockquote>
-
-<i>По всем вопросам обращайтесь</i>''',
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("👨‍💻 Написать", url=SUPPORT_LINK),
-                InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
-            ]]),
-            disable_web_page_preview=True
-        )
-        return
-    
-    if query.data == "menu_news":
-        await query.edit_message_text(
-            f'''<tg-emoji emoji-id="{BTN_NEWS}">🔧</tg-emoji> <b>НОВОСТИ</b>
-
-<blockquote>
-Все актуальные новости в нашем канале:
-{CHANNEL_URL}
-</blockquote>
-
-👇 <b>Переходи по ссылке:</b>''',
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📢 Перейти на канал", url=CHANNEL_URL),
-                InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
-            ]]),
-            disable_web_page_preview=True
-        )
-        return
-    
-    # Админ панель
-    if query.data == "admin_panel" and is_admin:
-        await query.edit_message_text("⚙️ <b>АДМИН ПАНЕЛЬ</b>\n\nВыбери действие:", parse_mode="HTML", reply_markup=get_admin_menu())
-        return
-    
-    if query.data == "admin_stats" and is_admin:
-        users_count = get_users_count()
-        total_requests = get_total_requests()
-        await query.edit_message_text(f"📊 <b>СТАТИСТИКА</b>\n\n<blockquote>├ 👥 Пользователей: {users_count}\n├ 📝 Всего запросов: {total_requests}\n└ 📅 {datetime.now().strftime('%d.%m.%Y')}</blockquote>", parse_mode="HTML", reply_markup=get_back_menu())
-        return
-    
-    if query.data == "admin_users" and is_admin:
-        users = get_all_users()
-        text = "👥 <b>СПИСОК ПОЛЬЗОВАТЕЛЕЙ</b>\n\n"
-        for u in users[:15]:
-            name = u[1] or u[2] or f"id{u[0]}"
-            text += f"├ {name} — {u[3]} запросов\n"
-        if len(users) > 15:
-            text += f"\n└ и ещё {len(users)-15}..."
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=get_back_menu())
-        return
-    
-    if query.data == "admin_broadcast" and is_admin:
-        context.user_data["awaiting_broadcast"] = True
-        await query.edit_message_text("📢 <b>РАССЫЛКА</b>\n\nОтправь сообщение для всех пользователей:", parse_mode="HTML", reply_markup=get_back_menu())
-        return
+    await callback.message.delete()
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=get_back_menu())
 
 
-async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user:
-        return
-    user_id = user.id
+@dp.callback_query(F.data == "menu_support")
+async def callback_menu_support(callback: types.CallbackQuery):
+    await callback.answer()
+    text = f'<tg-emoji emoji-id="{EMOJI_SUPPORT}">🆘</tg-emoji> <b>ПОДДЕРЖКА</b>\n\n<blockquote>\n📢 Канал: {CHANNEL_URL}\n👨‍💻 Техподдержка: {SUPPORT_LINK}\n</blockquote>'
     
-    if context.user_data.get("is_searching"):
-        await update.message.reply_text(
-            f'<tg-emoji emoji-id="{EMOJI_INFO}">⚠️</tg-emoji> <b>Поиск уже выполняется!</b>\n\nПодождите завершения текущего запроса.',
-            parse_mode="HTML"
-        )
+    await callback.message.delete()
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="НАПИСАТЬ", url=SUPPORT_LINK)],
+            [InlineKeyboardButton(text="◀ НАЗАД", callback_data="main_menu")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "menu_news")
+async def callback_menu_news(callback: types.CallbackQuery):
+    await callback.answer()
+    text = f'<tg-emoji emoji-id="{EMOJI_NEWS}">📰</tg-emoji> <b>НОВОСТИ</b>\n\n<blockquote>Все актуальные новости в нашем канале:\n{CHANNEL_URL}</blockquote>'
+    
+    await callback.message.delete()
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="ПЕРЕЙТИ", url=CHANNEL_URL)],
+            [InlineKeyboardButton(text="◀ НАЗАД", callback_data="main_menu")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "check_subscribe")
+async def callback_check_subscribe(callback: types.CallbackQuery):
+    await callback.answer()
+    mark_subscribed(callback.from_user.id)
+    await callback_main_menu(callback, None)
+
+
+# ========== АДМИН ПАНЕЛЬ ==========
+@dp.callback_query(F.data == "admin_panel")
+async def callback_admin_panel(callback: types.CallbackQuery):
+    await callback.answer()
+    user_info = get_user_info(callback.from_user.id)
+    if not user_info or not user_info.get("is_admin"):
+        await callback.message.answer("❌ Нет доступа")
         return
     
-    if not context.user_data.get("awaiting_search"):
-        await update.message.reply_text(f'<tg-emoji emoji-id="{BTN_SEARCH}">🔎</tg-emoji> Нажми "Искать" в меню', parse_mode="HTML")
+    await callback.message.delete()
+    await callback.message.answer("⚙️ <b>АДМИН ПАНЕЛЬ</b>\n\nВыбери действие:", parse_mode="HTML", reply_markup=get_admin_menu())
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def callback_admin_stats(callback: types.CallbackQuery):
+    await callback.answer()
+    user_info = get_user_info(callback.from_user.id)
+    if not user_info or not user_info.get("is_admin"):
         return
     
-    if not check_subscribed_to_channel(user_id):
-        await update.message.reply_text(f'⚠️ Подпишись на канал:\n{CHANNEL_URL}\n\nПосле подписки нажми /start', parse_mode="HTML")
-        context.user_data.pop("awaiting_search", None)
+    total_users, subscribed_users, total_requests, today_requests = get_stats()
+    text = f"📊 <b>СТАТИСТИКА</b>\n\n<blockquote>├ 👥 Пользователей: {total_users}\n├ ✅ Подписаны на канал: {subscribed_users}\n├ 📝 Запросов всего: {total_requests}\n├ 📊 Запросов сегодня: {today_requests}\n└ 📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}</blockquote>"
+    
+    await callback.message.delete()
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=get_back_menu())
+
+
+@dp.callback_query(F.data == "admin_logs")
+async def callback_admin_logs(callback: types.CallbackQuery):
+    await callback.answer()
+    user_info = get_user_info(callback.from_user.id)
+    if not user_info or not user_info.get("is_admin"):
         return
     
-    query = update.message.text.strip()
+    logs = get_recent_logs(20)
+    text = "📋 <b>ПОСЛЕДНИЕ ЗАПРОСЫ</b>\n\n"
+    for log in logs:
+        uid, q, st, sc, ts = log
+        text += f"├ {ts[:16]} | {uid} | {st} | {sc} ист.\n"
+    if not logs:
+        text += "├ Нет запросов\n"
+    
+    await callback.message.delete()
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=get_back_menu())
+
+
+@dp.callback_query(F.data == "admin_users")
+async def callback_admin_users(callback: types.CallbackQuery):
+    await callback.answer()
+    user_info = get_user_info(callback.from_user.id)
+    if not user_info or not user_info.get("is_admin"):
+        return
+    
+    users = get_users_list()
+    text = "👥 <b>СПИСОК ПОЛЬЗОВАТЕЛЕЙ</b>\n\n"
+    for u in users[:20]:
+        uid, uname, fname, treq, sub = u
+        name = uname or fname or f"id{uid}"
+        sub_status = "✅" if sub else "❌"
+        text += f"├ {sub_status} {name} — {treq} запросов\n"
+    if not users:
+        text += "├ Нет пользователей\n"
+    
+    await callback.message.delete()
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=get_back_menu())
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def callback_admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_info = get_user_info(callback.from_user.id)
+    if not user_info or not user_info.get("is_admin"):
+        return
+    
+    await callback.message.delete()
+    await callback.message.answer("📢 <b>РАССЫЛКА</b>\n\nОтправь сообщение для всех пользователей:", parse_mode="HTML", reply_markup=get_back_menu())
+    await state.set_state(BroadcastState.waiting_for_message)
+
+
+# ========== ПОИСК ==========
+@dp.message(SearchState.waiting_for_query)
+async def process_search(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    query = message.text.strip()
+    
     if not query:
-        await update.message.reply_text('Введите данные для поиска!')
+        await message.answer("❌ Введите данные для поиска!")
         return
     
     if not increment_request(user_id):
-        await update.message.reply_text(f'<tg-emoji emoji-id="{EMOJI_INFO}">❌</tg-emoji> <b>Лимит исчерпан!</b>\n\n50 запросов в день', parse_mode="HTML")
+        await message.answer("❌ Лимит исчерпан!\n\n50 запросов в день")
+        await state.clear()
         return
     
-    context.user_data["is_searching"] = True
+    await state.clear()
     
-    msg = await update.message.reply_text(
-        f'<tg-emoji emoji-id="{EMOJI_SEARCHING}">💬</tg-emoji> <b>Ищем данные, подождите...</b>\n\n<code>{query}</code>\n\n<tg-emoji emoji-id="{EMOJI_WAIT}">⏳</tg-emoji> <i>Это может занять до 2 минут</i>',
+    status_msg = await message.answer(
+        f'<tg-emoji emoji-id="{EMOJI_SEARCHING}">🔍</tg-emoji> <b>Ищем данные, подождите...</b>\n\n<code>{query}</code>\n\n<tg-emoji emoji-id="{EMOJI_WAIT}">⏳</tg-emoji> <i>Это может занять до 2 минут</i>',
         parse_mode="HTML"
     )
     
     success, result = await deepscan_search(query)
-    context.user_data["is_searching"] = False
     
     if success:
+        search_type = result.get('type', 'unknown')
+        sources_count = len(result.get('full-result', []))
+        log_search(user_id, query, search_type, sources_count)
+        
         html_content = generate_html_report(result, query)
         html_bytes = BytesIO(html_content.encode('utf-8'))
         html_bytes.name = f"insightx_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         
-        links_count = len(result.get('links', []))
-        sources_count = len(result.get('full-result', []))
-        
-        await msg.delete()
-        await update.message.reply_document(
-            document=html_bytes,
-            caption=f'<tg-emoji emoji-id="{EMOJI_SUCCESS}">✅</tg-emoji> <b>Результат найден!</b>\n\n📋 Запрос: <code>{query}</code>\n📊 Найдено источников: {links_count + sources_count}',
+        await status_msg.delete()
+        await message.answer_document(
+            document=types.BufferedInputFile(html_bytes.getvalue(), filename=html_bytes.name),
+            caption=f'<tg-emoji emoji-id="{EMOJI_SUCCESS}">✅</tg-emoji> <b>Результат найден!</b>\n\n<tg-emoji emoji-id="{EMOJI_SEARCH}">🔍</tg-emoji> <b>Запрос:</b> <code>{query}</code>\n\n<tg-emoji emoji-id="{EMOJI_USER}">👤</tg-emoji> <b>Найдено источников:</b> {sources_count}',
             parse_mode="HTML"
         )
     else:
-        await msg.edit_text(
-            f'<tg-emoji emoji-id="{EMOJI_INFO}">❌</tg-emoji> <b>НИЧЕГО НЕ НАЙДЕНО</b>\n\n<blockquote>\n{result.get("error", "Попробуйте другой запрос")}\n🔎 Запрос: <code>{query}</code>\n</blockquote>\n\n<tg-emoji emoji-id="{BTN_SUPPORT}">🐶</tg-emoji> <i>Обратитесь в поддержку</i>',
+        await status_msg.edit_text(
+            f'❌ <b>НИЧЕГО НЕ НАЙДЕНО</b>\n\n<blockquote>\n{result.get("error", "Попробуйте другой запрос")}\n🔎 Запрос: <code>{query}</code>\n</blockquote>',
             parse_mode="HTML",
             reply_markup=get_back_menu()
         )
 
 
-async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user:
-        return
-    user_id = user.id
+# ========== РАССЫЛКА ==========
+@dp.message(BroadcastState.waiting_for_message)
+async def process_broadcast(message: types.Message, state: FSMContext, bot: Bot):
+    user_id = message.from_user.id
     user_info = get_user_info(user_id)
     
     if not user_info or not user_info.get("is_admin"):
+        await state.clear()
         return
     
-    if not context.user_data.get("awaiting_broadcast"):
-        return
-    
-    text = update.message.text
     users = get_all_users()
+    
+    if not users:
+        await message.answer("❌ Нет пользователей для рассылки")
+        await state.clear()
+        return
+    
+    total = len(users)
     success = 0
     
-    for u in users:
-        try:
-            await update.message.bot.send_message(u[0], text, parse_mode="HTML", disable_web_page_preview=True)
-            success += 1
-            await asyncio.sleep(0.05)
-        except:
-            pass
+    status_msg = await message.answer(f"📢 НАЧИНАЮ РАССЫЛКУ {total} ПОЛЬЗОВАТЕЛЯМ...\n\n⏳ 0/{total} отправлено")
     
-    await update.message.reply_text(f"✅ Рассылка отправлена {success} пользователям")
-    context.user_data.pop("awaiting_broadcast", None)
+    if message.photo:
+        photo = message.photo[-1].file_id
+        caption = message.caption or ""
+        for i, uid in enumerate(users):
+            try:
+                await bot.send_photo(chat_id=uid, photo=photo, caption=caption, parse_mode="HTML")
+                success += 1
+                if (i + 1) % 5 == 0 or i == total - 1:
+                    await status_msg.edit_text(f"📢 РАССЫЛКА\n\n✅ {success}/{total} отправлено\n⏳ {total - success} осталось")
+                await asyncio.sleep(0.1)
+            except:
+                pass
+    elif message.video:
+        video = message.video.file_id
+        caption = message.caption or ""
+        for i, uid in enumerate(users):
+            try:
+                await bot.send_video(chat_id=uid, video=video, caption=caption, parse_mode="HTML")
+                success += 1
+                if (i + 1) % 5 == 0 or i == total - 1:
+                    await status_msg.edit_text(f"📢 РАССЫЛКА\n\n✅ {success}/{total} отправлено\n⏳ {total - success} осталось")
+                await asyncio.sleep(0.1)
+            except:
+                pass
+    else:
+        text = message.text
+        for i, uid in enumerate(users):
+            try:
+                await bot.send_message(chat_id=uid, text=text, parse_mode="HTML", disable_web_page_preview=True)
+                success += 1
+                if (i + 1) % 5 == 0 or i == total - 1:
+                    await status_msg.edit_text(f"📢 РАССЫЛКА\n\n✅ {success}/{total} отправлено\n⏳ {total - success} осталось")
+                await asyncio.sleep(0.1)
+            except:
+                pass
+    
+    await status_msg.edit_text(f"✅ РАССЫЛКА ЗАВЕРШЕНА\n\n📊 Отправлено: {success}/{total} пользователям\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    await state.clear()
 
 
-def main():
+@dp.message()
+async def handle_other_messages(message: types.Message):
+    await message.answer(
+        '🔍 Нажмите кнопку "НАЧАТЬ ПОИСК" в меню',
+        parse_mode="HTML",
+        reply_markup=get_back_menu()
+    )
+
+
+# ========== ЗАПУСК ==========
+async def main():
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(menu_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_handler))
+    print("=" * 50)
+    print("INSIGHT X БОТ ЗАПУЩЕН (aiogram)!")
+    print(f"Админ ID: {ADMIN_ID}")
+    print(f"База данных: {DB_PATH}")
+    print("=" * 50)
     
-    print("🔍 InsightX бот запущен!")
-    print(f"👑 Админ ID: {ADMIN_ID}")
-    print(f"💾 База данных: {DB_PATH}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
